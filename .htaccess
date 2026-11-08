@@ -1,0 +1,14 @@
+# Unity WebGL MIME types for Apache / XAMPP
+<IfModule mod_mime.c>
+  AddType application/wasm .wasm
+  AddType application/javascript .js
+  AddType application/octet-stream .data
+  AddType application/octet-stream .unityweb
+  AddType application/octet-stream .bundle
+</IfModule>
+
+# Optional security headers for WebGL performance (SharedArrayBuffer)
+<IfModule mod_headers.c>
+  Header set Access-Control-Allow-Origin "*"
+</IfModule>
+
