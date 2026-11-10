@@ -1,183 +1,304 @@
-# Epic Plane Evolution: Complete Cheat Engine Memory Reverse Engineering & Currency Manipulation Guide
+# Epic Plane Evolution: Definitive Cheat Engine Memory Reverse Engineering & Currency Manipulation Guide
 
 ---
 
-## 1. Executive Summary & Architecture
-
-"Epic Plane Evolution" is a Unity WebGL game compiled with **IL2CPP** running inside a Chromium-based browser (Brave / Chrome) over WebAssembly (WASM).
-
-### The Technical Challenge
-Traditional memory hacking in browser games fails in this game once currency exceeds **2.14 Billion** ($2^{31} - 1$). At that threshold:
-1. Normal 4-byte scans for the displayed coin count return 0 results.
-2. The memory address that previously held coins suddenly drops to `1`.
-3. Writing numbers directly to the old address no longer changes in-game money.
-
-This occurs because the game utilizes .NET's **`System.Numerics.BigInteger`** to handle arbitrary-precision currency, combined with the **32-bit WASM Linear Memory Sandbox** inside a 64-bit browser process.
+## Table of Contents
+1. [Architecture & The 2.14 Billion Problem](#1-architecture--the-214-billion-problem)
+2. [C# BigInteger Memory Anatomy (IL2CPP WASM)](#2-c-biginteger-memory-anatomy-il2cpp-wasm)
+3. [The Two States of Currency](#3-the-two-states-of-currency)
+4. [Array Memory Layout in 32-bit WASM](#4-array-memory-layout-in-32-bit-wasm)
+5. [The Chunk Mathematics & Formula](#5-the-chunk-mathematics--formula)
+6. [Interactive Calculation Scripts (Python & JavaScript)](#6-interactive-calculation-scripts-python--javascript)
+7. [Lookup Cheat Sheet (From 10B to 1 Quadrillion)](#7-lookup-cheat-sheet-from-10b-to-1-quadrillion)
+8. [The "Forced Transition" Trick (Moving from Millions to Trillions)](#8-the-forced-transition-trick-moving-from-millions-to-trillions)
+9. [Step-by-Step Operator Manual (With Visual Memory Dumps)](#9-step-by-step-operator-manual-with-visual-memory-dumps)
+10. [Why Addresses Disappear (Immutability & Garbage Collection)](#10-why-addresses-disappear-immutability--garbage-collection)
+11. [Cheat Engine Table Setup & The Freezing Strategy](#11-cheat-engine-table-setup--the-freezing-strategy)
+12. [Troubleshooting & Crash Prevention](#12-troubleshooting--crash-prevention)
 
 ---
 
-## 2. Core Concepts: How BigInteger Works in Memory
+## 1. Architecture & The 2.14 Billion Problem
 
-In Unity IL2CPP (32-bit WASM runtime), `System.Numerics.BigInteger` is an immutable 8-byte structure:
+"Epic Plane Evolution" is built with Unity and exported via **WebGL / IL2CPP**. 
+
+When running in Chromium browsers (Brave, Google Chrome, Edge):
+* The browser runs as a **64-bit host process** (`brave.exe` / `chrome.exe`).
+* The WebAssembly runtime allocates a dedicated, flat **32-bit linear memory space** within the process.
+* The start of this 32-bit sandbox is the **`AllocationBase`** (e.g., `0x35400000000` or `0x28500000000`).
+* All pointers inside the game's C# IL2CPP runtime are **32-bit offsets relative to `AllocationBase`**.
+
+### Why Standard Scans Fail at 2.14 Billion:
+In standard games, money is a 32-bit integer (`int32` or `uint32`), capped at $2,147,483,647$ ($2^{31}-1$). In idle and incremental games where values reach Trillions and Quadrillions, standard integers overflow.
+
+To solve this, the developers used **`System.Numerics.BigInteger`**. Once your money passes 2.14 Billion, the game completely shifts how money is stored in RAM, breaking traditional 4-byte searches.
+
+---
+
+## 2. C# BigInteger Memory Anatomy (IL2CPP WASM)
+
+In IL2CPP (32-bit WASM), the `System.Numerics.BigInteger` struct occupies exactly **8 consecutive bytes**:
 
 ```cpp
 struct BigInteger {
-    int32_t  _sign;   // Offset +0x00 (4 bytes)
-    uint32_t _bits;   // Offset +0x04 (4-byte pointer to uint32_t[] array)
+    int32_t  _sign;   // +0x00 (4 bytes): Sign indicator or direct small value
+    uint32_t _bits;   // +0x04 (4 bytes): 32-bit WASM heap pointer to uint32[] array
 };
 ```
 
-### State A: Small Currency ($\le 2,147,483,647$)
-* `_bits` is **`NULL` (`0x00000000`)**.
-* `_sign` holds the **exact raw coin count** as a signed 32-bit integer.
-* *Behavior:* A standard Cheat Engine 4-byte scan directly finds `_sign`.
-
-### State B: Large Currency ($> 2,147,483,647$)
-* Once coins cross $2^{31} - 1$, a 32-bit signed integer would overflow.
-* The engine switches representation:
-  * `_sign` is set to **`1`** (a flag signifying positive value).
-  * `_bits` is assigned a **32-bit heap pointer** pointing to a dynamically allocated `uint32[]` array in WASM memory.
-* *Behavior:* This is why Cheat Engine showed the value as `1`. The actual money was moved into the array referenced by `_bits`.
-
 ```
-Permanent Object (coinsAmount):
-[ Address: 28501CC2B0C ]
-+-------------------+-------------------+
-|  _sign (4 bytes)  |  _bits (4 bytes)  |
-|    01 00 00 00    |    00 0F 27 0E    |
-+-------------------+-------------------+
-          |                   |
-      Sign = +1         Pointer = 0x0E270F00 (WASM offset)
-                              |
-                              v
-                  [ Base: 0x28500000000 + 0x0E270F00 ]
-                  Array Object in Heap:
-                  +0x00: IL2CPP Klass Pointer
-                  +0x04: Monitor / SyncBlock
-                  +0x08: Bounds
-                  +0x0C: Array Length (uint32)
-                  +0x10: Chunk 1 (_bits[0] - Lower 32 bits)
-                  +0x14: Chunk 2 (_bits[1] - Upper 32 bits / Multiplier)
++------------------------------------+------------------------------------+
+|         _sign (Bytes 0-3)          |         _bits (Bytes 4-7)          |
+|              4 Bytes               |              4 Bytes               |
++------------------------------------+------------------------------------+
 ```
 
 ---
 
-## 3. The IL2CPP Array Memory Layout (WASM 32-bit)
+## 3. The Two States of Currency
 
-When `_bits` points to an array, the target memory follows standard IL2CPP array formatting:
+### State 1: The "Small Money" State ($\le 2,147,483,647$)
+* **`_sign`** contains the **literal coin amount**.
+* **`_bits`** is **`NULL` (`00 00 00 00`)**. No array exists on the heap!
+* **Visual Memory Dump Example (3,020,000 coins):**
+  ```text
+  Address      14 15 16 17  18 19 1A 1B
+  ...1CC2C14   E0 14 2E 00  00 00 00 00
+               \_________/  \_________/
+              _sign=3020000   _bits=NULL
+  ```
+  *(Note: `E0 14 2E 00` in Little-Endian hex is `0x002E14E0` = `3,020,000` decimal).*
 
-| Offset from Array Base | Field | Type | Description |
+### State 2: The "BigInteger" State ($> 2,147,483,647$)
+* **`_sign`** becomes **`1`** (a flag meaning positive number).
+* **`_bits`** becomes a **32-bit heap pointer** pointing to an allocated `uint32[]` array.
+* **Visual Memory Dump Example (Coins > 2.14B):**
+  ```text
+  Address      14 15 16 17  18 19 1A 1B
+  ...1CC2C14   01 00 00 00  70 C5 6F 0D
+               \_________/  \_________/
+                _sign = 1    Pointer to Array: 0x0D6FC570
+  ```
+  *(Note: `70 C5 6F 0D` reversed from Little-Endian is `0x0D6FC570`).*
+
+---
+
+## 4. Array Memory Layout in 32-bit WASM
+
+When `_bits` points to an array, the target memory location follows the IL2CPP Array layout:
+
+| Offset from Array Base | Field Name | Data Type | Purpose & Details |
 | :--- | :--- | :--- | :--- |
-| **`+ 0x00`** | Klass Pointer | 4 Bytes | Pointer to `System.UInt32[]` class descriptor |
-| **`+ 0x04`** | Monitor | 4 Bytes | Synchronization block header |
-| **`+ 0x08`** | Bounds Pointer | 4 Bytes | Array bounds descriptor |
-| **`+ 0x0C`** | **Array Length** | 4 Bytes | Number of elements in the array |
-| **`+ 0x10`** | **Chunk 1 (`_bits[0]`)**| 4 Bytes | Lower 32 bits (holds values from $0$ to $4,294,967,295$) |
-| **`+ 0x14`** | **Chunk 2 (`_bits[1]`)**| 4 Bytes | Multiplier for $2^{32}$ ($\approx 4.294967\text{B}$) |
-| **`+ 0x18`** | Chunk 3 (`_bits[2]`)| 4 Bytes | Multiplier for $2^{64}$ (only needed for Quintillions+) |
+| **`+ 0x00`** | `klass` | 4 Bytes (Pointer) | IL2CPP Class metadata for `System.UInt32[]` |
+| **`+ 0x04`** | `monitor` | 4 Bytes | Thread synchronization block |
+| **`+ 0x08`** | `bounds` | 4 Bytes (Pointer) | Array bounds descriptor |
+| **`+ 0x0C`** (`+12`) | **Array Length** | 4 Bytes (`uint32`) | Number of 32-bit chunks in the array (must be $\ge 2$) |
+| **`+ 0x10`** (`+16`) | **Chunk 1 (`_bits[0]`)** | 4 Bytes (`uint32`) | Lower 32 bits ($0$ to $4,294,967,295$) |
+| **`+ 0x14`** (`+20`) | **Chunk 2 (`_bits[1]`)** | 4 Bytes (`uint32`) | Multiplier for $2^{32}$ ($\approx 4.294967\text{B}$) |
+| **`+ 0x18`** (`+24`) | Chunk 3 (`_bits[2]`) | 4 Bytes (`uint32`) | Multiplier for $2^{64}$ (only needed for Quintillions+) |
+
+### Diagram of Array in Memory:
+```
+Array Base Address (AllocationBase + Pointer)
++------------------------+-----------------------------------------------+
+| Offset                 | Content                                       |
++------------------------+-----------------------------------------------+
+| +0x00 to +0x0B         | IL2CPP Header (12 bytes of internal metadata)  |
+| +0x0C (Length)         | 02 00 00 00  (Length = 2 chunks)              |
+| +0x10 (Chunk 1)        | Lower 32 bits of coin value                   |
+| +0x14 (Chunk 2)        | Upper 32 bits (Trillion Multiplier)           |
++------------------------+-----------------------------------------------+
+```
 
 ---
 
-## 4. The Currency Formula & Calculations
+## 5. The Chunk Mathematics & Formula
 
-The value of the currency is computed as:
+The total coin value is mathematically reconstructed by combining the chunks in base-$2^{32}$:
+
 $$\text{Total Coins} = \text{Chunk 1} + (\text{Chunk 2} \times 2^{32})$$
 $$\text{where } 2^{32} = 4,294,967,296$$
 
-### How to Calculate Chunks for Any Target Amount
-To generate any desired coin amount:
-1. **$\text{Chunk 2} = \lfloor \text{Target} / 4,294,967,296 \rfloor$** (Integer division)
-2. **$\text{Chunk 1} = \text{Target} \pmod{4,294,967,296}$** (Remainder)
-3. **$\text{Array Length} = 2$** (Must be at least 2 so the game reads both chunks)
-
-### Quick Reference Table
-| Target Money | Chunk 1 (`_bits[0]`) | Chunk 2 (`_bits[1]`) | Array Length |
-| :--- | :--- | :--- | :--- |
-| **10 Billion (10B)** | `1410065408` | `2` | `2` |
-| **100 Billion (100B)** | `1215752192` | `23` | `2` |
-| **1 Trillion (1T)** | `3567587328` | `232` | `2` |
-| **20 Trillion (20T)** | `2632269824` | `4656` | `2` |
-| **500 Trillion (500T)** | **`1382236160`** | **`116415`** | `2` |
-| **1 Quadrillion (1Q)** | `2764472320` | `232830` | `2` |
+### Step-by-Step Calculation Formula:
+Given any target coin amount $\mathbf{T}$:
+1. **$\text{Chunk 2} = \lfloor \mathbf{T} / 4,294,967,296 \rfloor$** *(Integer division)*
+2. **$\text{Chunk 1} = \mathbf{T} \pmod{4,294,967,296}$** *(Remainder / modulo)*
+3. **$\text{Array Length} = 2$**
 
 ---
 
-## 5. Why Edits Stop Working: The Immutability Reallocation Issue
+## 6. Interactive Calculation Scripts (Python & JavaScript)
 
-If you modify Chunk 1 and Chunk 2 and see no effect, or the values suddenly reset, this is due to **C# Immutability**:
+### Python Snippet:
+Run this anywhere to get the exact numbers for any amount:
+```python
+def calculate_chunks(target_coins):
+    CHUNK_SIZE = 4294967296  # 2^32
+    chunk_2 = target_coins // CHUNK_SIZE
+    chunk_1 = target_coins % CHUNK_SIZE
+    
+    print(f"--- TARGET: {target_coins:,} ---")
+    print(f"Array Length: 2")
+    print(f"Chunk 1 (Lower 32-bit): {chunk_1}")
+    print(f"Chunk 2 (Multiplier):   {chunk_2}")
 
-1. In .NET, `System.Numerics.BigInteger` is an **immutable struct**. 
-2. Whenever any arithmetic happens (earning offline income, collecting flight rewards, or purchasing an upgrade):
-   $$\text{coinsAmount}_{\text{new}} = \text{coinsAmount}_{\text{old}} \pm \Delta$$
-3. Because it is immutable, the game **never overwrites the existing array in place**. Instead, it:
-   - Allocates a **new `uint[]` array** at a different memory address on the garbage-collected heap.
-   - Calculates the new value and writes it into this new array.
-   - Updates the pointer at `_bits` (`coinsAmount + 0x4`) to point to the new array.
-   - Abandons the old array for the garbage collector.
-4. **The Consequence:** If the game ticks passive income before you make your move, the address you were editing is already orphaned.
+# Example: 50 Trillion
+calculate_chunks(50_000_000_000_000)
+```
 
----
+### Browser Console Snippet (No Python required):
+Open your browser DevTools Console (`F12`) and paste:
+```javascript
+function getChunks(trillions) {
+    const target = BigInt(trillions) * 1000000000000n;
+    const CHUNK = 4294967296n;
+    console.log(`--- For ${trillions} Trillion ---`);
+    console.log("Array Length: 2");
+    console.log("Chunk 1:", (target % CHUNK).toString());
+    console.log("Chunk 2:", (target / CHUNK).toString());
+}
 
-## 6. Complete Operator Guide (Step-by-Step)
-
-Follow this exact procedure to locate, calculate, and modify money reliably:
-
-### Step 1: Attach Cheat Engine to the Browser
-1. In Brave/Chrome, press `Shift + Esc` to view Chrome's internal Task Manager.
-2. Find the tab named **"YT Game Wrapper WebGL"** (or the game frame) and note its **Process ID (PID)**.
-3. In Cheat Engine, click the **Process List** button $\rightarrow$ switch to the **Processes** tab $\rightarrow$ select the matching hex PID (e.g. `000066D0-brave.exe`).
-
-### Step 2: Locate the `coinsAmount` Object Address
-1. Start with your coins below 2 Billion (spend or restart if necessary).
-2. Scan for your current coin count (`4 Bytes`).
-3. Fly or upgrade once to change coins, then scan for `Increased value` or the exact new number.
-4. When you isolate the address, you have found `_sign`.
-   *(In your session, this was at `...1CC2B0C`).*
-
-### Step 3: Find the Dynamic Array Address
-1. Right-click the found address $\rightarrow$ select **Browse this memory region** (Memory Viewer).
-2. Look at the 8 bytes starting at your address:
-   - First 4 bytes (`+0x00`): `_sign` (shows `01 00 00 00` when $> 2.14\text{B}$).
-   - Next 4 bytes (`+0x04`): `_bits` pointer (e.g., `00 0F 27 0E`).
-3. Reverse the 4 bytes from Little-Endian to Hex:
-   - `00 0F 27 0E` $\rightarrow$ `0x0E270F00`.
-4. Look at the title/header of the Memory Viewer for `AllocationBase` (e.g., `AllocationBase=28500000000`).
-5. Add the base and offset:
-   $$\text{Array Base} = \text{AllocationBase} + \text{Pointer} = \text{0x28500000000} + \text{0x0E270F00} = \mathbf{\text{0x2850E270F00}}$$
-
-### Step 4: The Dynamic Pointer Method (The "Never-Lose-Address" Setup)
-Instead of manually recalculating addresses every time the game moves the array, you can set up Cheat Engine to **automatically follow the pointer**:
-
-1. In Cheat Engine, click **Add Address Manually**.
-2. Check the **[X] Pointer** box.
-3. In the base address field at the bottom, enter the `_bits` address (e.g. `28501CC2B10`).
-4. Set the offset:
-   - For **Array Length**: Offset = `C`
-   - For **Chunk 1 (Real Money)**: Offset = `10`
-   - For **Chunk 2 (Multiplier)**: Offset = `14`
-5. Cheat Engine will now automatically resolve and update the memory location whenever the game reallocates the array!
-
-### Step 5: Applying the Values Without Crashing
-1. **Pause Game Execution:** Click **Settings** in CE or use hotkeys (or simply pause before an income tick).
-2. Ensure **Array Length** is set to `2`.
-3. Set **Chunk 1** to `1382236160` (for 500T).
-4. Set **Chunk 2** to `116415` (for 500T).
-5. Unpause the game and click any upgrade button or fly once.
-6. The UI immediately reads the two chunks and displays **`500T`**.
+getChunks(50); // Calculates 50 Trillion
+```
 
 ---
 
-## 7. Troubleshooting & Recovery Checklist
+## 7. Lookup Cheat Sheet (From 10B to 1 Quadrillion)
 
-* **Q: I modified Chunk 1 and Chunk 2, but the game still displays the old value.**
-  * *Reason:* An income tick triggered and generated a new array pointer right before your edit.
-  * *Fix:* Check `_bits` in Memory Viewer. If the 4 bytes changed, recalculate the array address or use the **Pointer Method** from Step 4.
+| Target Amount | Display | Chunk 1 (`_bits[0]`) | Chunk 2 (`_bits[1]`) | Array Length |
+| :--- | :--- | :--- | :--- | :---: |
+| $10,000,000,000$ | **10B** | `1410065408` | `2` | `2` |
+| $50,000,000,000$ | **50B** | `2755359744` | `11` | `2` |
+| $100,000,000,000$ | **100B** | `1215752192` | `23` | `2` |
+| $500,000,000,000$ | **500B** | `1783793664` | `116` | `2` |
+| $1,000,000,000,000$ | **1T** | `3567587328` | `232` | `2` |
+| $10,000,000,000,000$ | **10T** | `4223940608` | `2328` | `2` |
+| $20,000,000,000,000$ | **20T** | `2632269824` | `4656` | `2` |
+| $50,000,000,000,000$ | **50T** | `2285707264` | `11641` | `2` |
+| $100,000,000,000,000$ | **100T** | `276447232` | `23283` | `2` |
+| $500,000,000,000,000$ | **500T** | `1382236160` | `116415` | `2` |
+| $1,000,000,000,000,000$ | **1 Quadrillion (1Q)** | `2764472320` | `232830` | `2` |
 
-* **Q: The game crashed after editing.**
-  * *Reason:* You modified an upgrade level index (e.g., `incomeLevel`) beyond its array bounds, or set `Array Length` to a number smaller than the chunks being read.
-  * *Fix:* Always keep `Array Length` set to `2` or higher when editing Chunk 2. Never edit game level indexes beyond known limits.
+---
 
-* **Q: Cheat Engine cannot find the value when scanning.**
-  * *Reason:* You attached to the Chrome/Brave GPU or Broker process instead of the dedicated Renderer tab process.
-  * *Fix:* Use Chrome Task Manager (`Shift + Esc`) to find the exact tab PID.
+## 8. The "Forced Transition" Trick (Moving from Millions to Trillions)
 
+If you currently have less than 2.14 Billion (e.g. 3 Million), the array **does not exist yet in memory** (`_bits` is `00 00 00 00`). You cannot write to an array that hasn't been allocated!
+
+Instead of flying hundreds of times to earn 2.14B legitimately, use the **Forced Transition Trick**:
+
+1. In Cheat Engine, find the 4-byte `MONEY VAR` (`_sign`).
+2. Change its value directly to **`2140000000`** *(2.14 Billion - just under the limit)*.
+3. Switch back to the game and **tap fly once** or buy a cheap level 1 upgrade.
+4. Earning any coins pushes the total over $2,147,483,647$.
+5. The game engine's C# code triggers:
+   - It sets `_sign` to **`1`**.
+   - It executes `new uint32[]` on the heap and writes the new pointer into `_bits`!
+6. You are now officially in BigInteger mode, and the array is ready to edit.
+
+---
+
+## 9. Step-by-Step Operator Manual (With Visual Memory Dumps)
+
+### Step 1: Attach Cheat Engine to the Correct Browser Tab
+1. In Brave/Chrome, press `Shift + Esc` to open the internal Chrome Task Manager.
+2. Locate the tab titled **`YT Game Wrapper WebGL`** and check its **Process ID (PID)**.
+3. In Cheat Engine, click the **Monitor/Process icon** $\rightarrow$ select the matching process (e.g. `000066D0-brave.exe`).
+
+### Step 2: Locate the `MONEY VAR` Address
+1. Start with your small coin amount (e.g. `3020000`).
+2. Search `Exact Value`, Type: `4 Bytes`, enter `3020000`.
+3. Do one flight, scan for `Increased value` or the new number until 1 address remains.
+4. Add it to your address table and label it: **`MONEY VAR (4byte)`**.
+
+### Step 3: Trigger BigInteger Mode
+*(See Section 8: Change value to `2140000000`, fly once. `MONEY VAR` will turn into `1`).*
+
+### Step 4: Inspect Memory Viewer to Get the Pointer
+1. Right-click `MONEY VAR` in Cheat Engine $\rightarrow$ click **Browse this memory region**.
+2. Look at the top header of the window:
+   ```text
+   Protect:Read/Write  AllocationBase=35400000000  Base=35401CC2000 ...
+   ```
+   Note down your **`AllocationBase`** (e.g. `0x35400000000`).
+3. Look at your `MONEY VAR` row:
+   ```text
+   address     14 15 16 17  18 19 1A 1B
+   ...1CC2C14  01 00 00 00  70 C5 6F 0D
+               \_________/  \_________/
+                _sign = 1    Pointer bytes
+   ```
+4. Read the 4 bytes at `18 19 1A 1B` in **reverse order** (Little-Endian to Big-Endian):
+   - `70 C5 6F 0D` $\rightarrow$ **`0x0D6FC570`**.
+
+### Step 5: Calculate the Array Address
+Add `AllocationBase` and your `Pointer`:
+$$\text{Array Base} = \text{0x35400000000} + \text{0x0D6FC570} = \mathbf{\text{0x3540D6FC570}}$$
+
+Now apply the standard offsets:
+* **Array Length (`+0xC`):** `0x3540D6FC570 + 0xC` = **`3540D6FC57C`**
+* **Chunk 1 (`+0x10`):** `0x3540D6FC570 + 0x10` = **`3540D6FC580`**
+* **Chunk 2 (`+0x14`):** `0x3540D6FC570 + 0x14` = **`3540D6FC584`**
+
+### Step 6: Add and Set the 3 Entries in Cheat Engine
+Click **Add Address Manually** in Cheat Engine for each entry:
+
+| Description | Address | Type | Value (for 50T) | Freeze [X] |
+| :--- | :--- | :--- | :--- | :---: |
+| **Array Length** | `3540D6FC57C` | 4 Bytes | **`2`** | ` ` |
+| **Real money chunk 1** | `3540D6FC580` | 4 Bytes | **`2285707264`** | **`[X]`** |
+| **Trillion multiplier chunk 2** | `3540D6FC584` | 4 Bytes | **`11641`** | **`[X]`** |
+
+---
+
+## 10. Why Addresses Disappear (Immutability & Garbage Collection)
+
+In .NET / C#, **`BigInteger` is strictly immutable**.
+
+Whenever an arithmetic operation happens (e.g. passive income tick, upgrade purchase, flight reward):
+$$\text{coins}_{\text{new}} = \text{coins}_{\text{old}} \pm \text{delta}$$
+
+Because the struct is immutable:
+1. Unity **never modifies the existing array in place**.
+2. It allocates a **brand new `uint32[]` array** elsewhere in the heap.
+3. It writes the result into the new array.
+4. It overwrites `_bits` with the **new array's address**.
+5. The old array is orphaned and collected by the garbage collector.
+
+**The Solution:** This is why we **Freeze (`Active [X]`)** Chunk 1 and Chunk 2 in Cheat Engine!
+
+---
+
+## 11. Cheat Engine Table Setup & The Freezing Strategy
+
+### Why Freezing Works:
+When you check the **`Active` [X]** box next to **Chunk 1** and **Chunk 2**:
+* Cheat Engine continuously forces those exact numbers into memory many times per second.
+* When the game's UI code runs to draw the money bar, it reads Chunk 1 and Chunk 2 and displays **`50T`**.
+* When you buy an upgrade, the game calculates `50T - upgrade_cost`, and Cheat Engine immediately resets it back to `50T`, giving you **infinite currency**.
+* Furthermore, because the value is locked, the array pointer rarely moves!
+
+### The Perfect Final Cheat Table View:
+```text
+Active  Description                   Address        Type     Value
+[ ]     MONEY VAR (4byte)             35401CC2C14    4 Bytes  1
+[ ]     Array Length                  3540D6FC57C    4 Bytes  2
+[X]     Real money chunk 1            3540D6FC580    4 Bytes  2285707264
+[X]     trillion multiplier chunk 2   3540D6FC584    4 Bytes  11641
+```
+
+---
+
+## 12. Troubleshooting & Crash Prevention
+
+* **Why did the game crash previously?**
+  * *Reason:* Modifying upgrade level variables (like `incomeLevel` or `slingshotLevel`) to arbitrary numbers like `999999` crashes the game because level data is stored in finite arrays. Requesting level index `999999` throws an `IndexOutOfRangeException` in C#.
+  * *Rule:* **Only modify currency chunks**, never edit the upgrade levels directly! Buy the upgrades legitimately using your 50 Trillion coins.
+
+* **Why did the value not update on the screen?**
+  * *Reason:* Unity WebGL only re-renders the text mesh when a game event fires (a flight finishes or an upgrade button is pressed).
+  * *Fix:* Simply press any upgrade button or launch your plane once; the UI will instantly refresh to your Trillions.
+
+* **What if the browser restarts or refreshes?**
+  * *Reason:* When the browser refreshes, `AllocationBase` and the memory offsets will change.
+  * *Fix:* Simply repeat the 5-minute process: scan 4-byte money, apply the Forced Transition trick, read the new pointer, and set Chunk 1 and Chunk 2.
